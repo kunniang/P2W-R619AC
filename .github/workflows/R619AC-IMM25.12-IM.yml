@@ -190,6 +190,9 @@ jobs:
             CONFIG_PACKAGE_sing-box=y \
             CONFIG_PACKAGE_v2ray-geoip=y \
             CONFIG_PACKAGE_v2ray-geosite=y \
+            CONFIG_PACKAGE_geoview=y \
+            CONFIG_PACKAGE_ddns-go=y \
+            CONFIG_PACKAGE_luci-app-ddns-go=y \
             CONFIG_PACKAGE_kmod-wireguard=y \
             CONFIG_PACKAGE_wireguard-tools=y \
             CONFIG_PACKAGE_luci-proto-wireguard=y \
@@ -301,7 +304,8 @@ jobs:
           - **管理账号**: root
           - **管理密码**: 无密码，初次登录直接进入
           - **网络模式**: PPPoE 拨号 / IPv6 / 无无线（纯有线）
-          - **代理**: PassWall（仅 Sing-Box 内核，含 geoip/geosite 分流数据）
+          - **代理**: PassWall（仅 Sing-Box 内核，含 geoview 规则转换与 geoip/geosite 分流数据）
+          - **DDNS**: 已内置 ddns-go（服务 → DDNS-GO）
           - **WireGuard**: 已内置服务端支持（网络 → 接口 → 协议选 WireGuard）；含 wg-server-init 时可 `wg-server-init -e 你的域名` 一键部署
           - **底层源码**: [ImmortalWrt 25.12](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)
           EOF
