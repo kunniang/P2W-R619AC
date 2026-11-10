@@ -1,0 +1,349 @@
+name: Build R619AC-IMM25.12-IM
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'Debugging with tmate'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: 0 0 28 * *
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  FEEDS_CONF: R619AC-25.12.feeds.conf.default
+  CONFIG_FILE: R619AC-25.12.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  AUTO_RELEASE_PREFIX: R619AC-IMM25.12-
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required files
+        run: |
+          for file in "$CONFIG_FILE" "$DIY_P1_SH" "$DIY_P2_SH" "files/usr/bin/wg-server-init"; do
+            if [ ! -e "$file" ]; then
+              echo "::error::Missing required file: $file"
+              exit 1
+            fi
+          done
+          chmod +x "files/usr/bin/wg-server-init"
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 这套配置要编 immortalwrt 全量 + passwall + sing-box，磁盘余量必须留够，
+          # 除了常见的 dotnet/android/ghc，CodeQL（约 5GB）和 boost/swift 也一起清掉
+          sudo rm -rf /etc/apt/sources.list.d/* \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/lib/node_modules
+          docker rmi $(docker images -q) 2>/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile || true
+
+          sudo -E apt-get -qq update
+
+          sudo -E apt-get -qq install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses5-dev libssl-dev \
+            python3 python3-pip python3-ply python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl swig time xsltproc \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libreadline-dev libz-dev \
+            zstd qemu-utils upx-ucl ccache device-tree-compiler
+
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+
+          python3 -m pip install --user --upgrade "cmake>=3.31,<3.32"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          sudo ln -sf "$HOME/.local/bin/cmake" /usr/local/bin/cmake
+          sudo ln -sf "$HOME/.local/bin/ctest" /usr/local/bin/ctest
+          sudo ln -sf "$HOME/.local/bin/cpack" /usr/local/bin/cpack
+
+          sudo timedatectl set-timezone "$TZ"
+
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+          df -hT
+
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          df -hT $PWD
+          git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+      - name: Load custom feeds
+        run: |
+          if [ -e "$FEEDS_CONF" ]; then
+            cp "$FEEDS_CONF" openwrt/feeds.conf.default
+          else
+            echo "::warning::Optional feeds file not found: $FEEDS_CONF, using upstream default"
+          fi
+
+          chmod +x "$DIY_P1_SH"
+          sed -i -e 's/\r$//' "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          sed -i '1s/^\xEF\xBB\xBF//' "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          # passwall 的 sing-box 需要较新的 go 工具链，换掉 feeds 自带的老版本
+          rm -rf feeds/packages/lang/golang
+          git clone https://github.com/sbwml/packages_lang_golang -b 26.x feeds/packages/lang/golang
+
+      - name: Install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds install -a
+
+      - name: Load custom configuration
+        run: |
+          if [ -e files ]; then
+            mv files openwrt/files
+          fi
+
+          if [ -e "$CONFIG_FILE" ]; then
+            cp "$CONFIG_FILE" openwrt/.config
+          fi
+
+          chmod +x "$DIY_P2_SH"
+          sed -i -e 's/\r$//' "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          sed -i '1s/^\xEF\xBB\xBF//' "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+          # WireGuard 部署工具必须随固件进 rootfs
+          test -f files/usr/bin/wg-server-init \
+            || { echo "::error::files/usr/bin/wg-server-init 没有进到 openwrt/files"; exit 1; }
+          chmod 755 files/usr/bin/wg-server-init
+
+      - name: SSH connection to Actions
+        uses: P3TERX/ssh2actions@v1.0.0
+        if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Download package
+        id: package
+        run: |
+          export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+
+          cd openwrt
+          make defconfig
+
+          # 必需项：少一个就直接失败，避免白编译一小时
+          for pkg in \
+            CONFIG_PACKAGE_luci-app-passwall=y \
+            CONFIG_PACKAGE_sing-box=y \
+            CONFIG_PACKAGE_v2ray-geoip=y \
+            CONFIG_PACKAGE_v2ray-geosite=y \
+            CONFIG_PACKAGE_kmod-wireguard=y \
+            CONFIG_PACKAGE_wireguard-tools=y \
+            CONFIG_PACKAGE_luci-proto-wireguard=y \
+            CONFIG_PACKAGE_kmod-pppoe=y \
+            CONFIG_PACKAGE_odhcp6c=y; do
+            if ! grep -qx "$pkg" .config; then
+              echo "::error::Missing required package after defconfig: ${pkg#CONFIG_PACKAGE_}"
+              exit 1
+            fi
+          done
+
+          # 禁止项：只跑 sing-box，xray 不能进来；无线驱动必须真的关掉
+          for pkg in xray-core kmod-ath10k-ct; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "::error::CONFIG_PACKAGE_${pkg} 仍被启用，与预期不符"
+              exit 1
+            fi
+          done
+
+          # hostapd 属于"没关干净"而不是致命问题，只提示
+          for pkg in wpad-openssl wpad-basic-mbedtls luci-app-openclash; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "::warning::CONFIG_PACKAGE_${pkg} 仍被启用，会多占体积"
+            fi
+          done
+
+          make download -j$(($(nproc)+1))
+
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile the firmware
+        id: compile
+        run: |
+          export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+
+          cd openwrt
+          echo "$(nproc) thread compile"
+
+          make -j$(($(nproc)+1)) || make -j4 || make -j1 V=s
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+
+          if [ -s DEVICE_NAME ]; then
+            echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          fi
+
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+      - name: If Error
+        if: steps.compile.outcome == 'failure'
+        run: |
+          export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+
+          if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            curl "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+              -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=Firmware compile failed."
+          fi
+
+          cat openwrt/.config
+          echo '================================================================'
+
+          cd openwrt
+          make -j1 V=s
+
+      - name: Check space usage
+        if: always()
+        run: df -hT
+
+      - name: Upload bin directory
+        uses: actions/upload-artifact@v4
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin
+
+      - name: Organize files
+        id: organize
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+        run: |
+          cd openwrt/bin/targets/*/*
+          rm -rf packages
+
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@v4
+        if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          name: IMM25.12-${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+
+      - name: Generate release tag
+        id: tag
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+        run: |
+          cat > release.txt <<'EOF'
+          ## R619AC ImmortalWrt 25.12 固件（Sing-Box 版）
+
+          :clock3: **构建时间**: BUILD_TIME
+          :calendar: **自动发布**: 每月 28 日自动构建更新
+
+          ### :red_envelope: 固件说明
+
+          - **后台地址**: 192.168.88.1
+          - **管理账号**: root
+          - **管理密码**: 无密码，初次登录直接进入
+          - **网络模式**: PPPoE 拨号 / IPv6 / 无无线（纯有线）
+          - **代理**: PassWall（仅 Sing-Box 内核，含 geoip/geosite 分流数据）
+          - **WireGuard**: 已内置服务端支持，SSH 执行 `wg-server-init -e 你的域名` 一键部署
+          - **底层源码**: [ImmortalWrt 25.12](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)
+          EOF
+          sed -i "s/BUILD_TIME/$(date +"%Y-%m-%d %H:%M:%S")/" release.txt
+
+          echo "release_tag=R619AC-IMM25.12-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v2
+        if: steps.organize.outputs.status == 'success' && steps.tag.outputs.status == 'success' && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: ${{ env.FIRMWARE }}/*
+
+      - name: Remove old auto releases
+        uses: actions/github-script@v7
+        if: steps.organize.outputs.status == 'success' && steps.tag.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prefix = process.env.AUTO_RELEASE_PREFIX;
+            const keepLatest = 6;
+            const { owner, repo } = context.repo;
+
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 }
+            );
+
+            const autoReleases = releases
+              .filter(release => release.tag_name && release.tag_name.startsWith(prefix))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            const releasesToDelete = autoReleases.slice(keepLatest);
+
+            core.info(`Found ${autoReleases.length} auto releases with prefix ${prefix}`);
+            core.info(`Deleting ${releasesToDelete.length} old auto releases`);
+
+            for (const release of releasesToDelete) {
+              core.info(`Deleting release ${release.tag_name} (${release.id})`);
+              await github.rest.repos.deleteRelease({
+                owner,
+                repo,
+                release_id: release.id,
+              });
+
+              try {
+                await github.rest.git.deleteRef({
+                  owner,
+                  repo,
+                  ref: `tags/${release.tag_name}`,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                core.info(`Tag already missing: ${release.tag_name}`);
+              }
+            }
