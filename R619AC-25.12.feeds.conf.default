@@ -1,0 +1,13 @@
+# 25.12 源码树配 25.12 分支的 feeds，第三方源只作为补充
+src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
+src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
+src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
+src-git telephony https://github.com/openwrt/telephony.git;openwrt-25.12
+src-git video https://github.com/openwrt/video.git;openwrt-25.12
+
+# 第三方补充源
+# 注意：这两个源里都有 luci-app-passwall / luci-app-openclash / sing-box / chinadns-ng /
+# xray-core，与 diy-part2.sh 里 clone 的官方版重复。diy-part2.sh 会把这里的重复项删掉，
+# 只保留官方版本。如果要新增第三方插件，建议在这里加源并在 config 里显式选中。
+src-git kenzo https://github.com/kenzok8/small-package.git
+src-git small https://github.com/kenzok8/small.git
