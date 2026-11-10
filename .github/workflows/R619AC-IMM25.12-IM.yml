@@ -32,6 +32,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -39,78 +40,59 @@ jobs:
 
       - name: Validate required files
         run: |
-          for file in "$CONFIG_FILE" "$DIY_P1_SH" "$DIY_P2_SH"; do
-            if [ ! -f "$file" ]; then
-              echo "Missing required file: $file"
+          for file in "$CONFIG_FILE" "$DIY_P1_SH" "$DIY_P2_SH" "files/usr/bin/wg-server-init"; do
+            if [ ! -e "$file" ]; then
+              echo "::error::Missing required file: $file"
               exit 1
             fi
           done
+          chmod +x "files/usr/bin/wg-server-init"
 
       - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # 这套配置要编 immortalwrt 全量 + passwall + sing-box，磁盘余量必须留够，
+          # 除了常见的 dotnet/android/ghc，CodeQL（约 5GB）和 boost/swift 也一起清掉
           sudo rm -rf /etc/apt/sources.list.d/* \
             /usr/share/dotnet \
             /usr/local/lib/android \
-            /opt/ghc
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/lib/node_modules
+          docker rmi $(docker images -q) 2>/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile || true
 
           sudo -E apt-get -qq update
 
           sudo -E apt-get -qq install -y \
-            build-essential \
-            clang \
-            flex \
-            bison \
-            g++ \
-            gawk \
-            gcc-multilib \
-            g++-multilib \
-            gettext \
-            git \
-            libncurses5-dev \
-            libssl-dev \
-            python3 \
-            python3-pip \
-            python3-ply \
-            python3-setuptools \
-            rsync \
-            unzip \
-            zlib1g-dev \
-            file \
-            wget \
-            curl \
-            swig \
-            time \
-            xsltproc \
-            libelf-dev \
-            libglib2.0-dev \
-            libgmp3-dev \
-            libltdl-dev \
-            libmpc-dev \
-            libmpfr-dev \
-            libreadline-dev \
-            libz-dev \
-            zstd \
-            qemu-utils \
-            upx-ucl \
-            ccache \
-            device-tree-compiler
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses5-dev libssl-dev \
+            python3 python3-pip python3-ply python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl swig time xsltproc \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libreadline-dev libz-dev \
+            zstd qemu-utils upx-ucl ccache device-tree-compiler
 
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
+
           python3 -m pip install --user --upgrade "cmake>=3.31,<3.32"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           sudo ln -sf "$HOME/.local/bin/cmake" /usr/local/bin/cmake
           sudo ln -sf "$HOME/.local/bin/ctest" /usr/local/bin/ctest
           sudo ln -sf "$HOME/.local/bin/cpack" /usr/local/bin/cpack
-          export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
-          which cmake
-          cmake --version
+
           sudo timedatectl set-timezone "$TZ"
 
           sudo mkdir -p /workdir
           sudo chown $USER:$GROUPS /workdir
+
+          df -hT
 
       - name: Clone source code
         working-directory: /workdir
@@ -122,14 +104,14 @@ jobs:
       - name: Load custom feeds
         run: |
           if [ -e "$FEEDS_CONF" ]; then
-            mv "$FEEDS_CONF" openwrt/feeds.conf.default
+            cp "$FEEDS_CONF" openwrt/feeds.conf.default
           else
-            echo "Optional feeds file not found: $FEEDS_CONF"
-            echo "Using upstream default feeds.conf.default"
+            echo "::warning::Optional feeds file not found: $FEEDS_CONF, using upstream default"
           fi
 
           chmod +x "$DIY_P1_SH"
           sed -i -e 's/\r$//' "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          sed -i '1s/^\xEF\xBB\xBF//' "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
           cd openwrt
           "$GITHUB_WORKSPACE/$DIY_P1_SH"
@@ -138,6 +120,7 @@ jobs:
         run: |
           cd openwrt
           ./scripts/feeds update -a
+          # passwall 的 sing-box 需要较新的 go 工具链，换掉 feeds 自带的老版本
           rm -rf feeds/packages/lang/golang
           git clone https://github.com/sbwml/packages_lang_golang -b 26.x feeds/packages/lang/golang
 
@@ -153,14 +136,20 @@ jobs:
           fi
 
           if [ -e "$CONFIG_FILE" ]; then
-            mv "$CONFIG_FILE" openwrt/.config
+            cp "$CONFIG_FILE" openwrt/.config
           fi
 
           chmod +x "$DIY_P2_SH"
           sed -i -e 's/\r$//' "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          sed -i '1s/^\xEF\xBB\xBF//' "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
           cd openwrt
           "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+          # WireGuard 部署工具必须随固件进 rootfs
+          test -f files/usr/bin/wg-server-init \
+            || { echo "::error::files/usr/bin/wg-server-init 没有进到 openwrt/files"; exit 1; }
+          chmod 755 files/usr/bin/wg-server-init
 
       - name: SSH connection to Actions
         uses: P3TERX/ssh2actions@v1.0.0
@@ -173,19 +162,39 @@ jobs:
         id: package
         run: |
           export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
-          which cmake
-          cmake --version
 
           cd openwrt
           make defconfig
 
+          # 必需项：少一个就直接失败，避免白编译一小时
           for pkg in \
-            CONFIG_PACKAGE_luci-app-openclash=y \
             CONFIG_PACKAGE_luci-app-passwall=y \
-            CONFIG_PACKAGE_xray-core=y; do
+            CONFIG_PACKAGE_sing-box=y \
+            CONFIG_PACKAGE_v2ray-geoip=y \
+            CONFIG_PACKAGE_v2ray-geosite=y \
+            CONFIG_PACKAGE_kmod-wireguard=y \
+            CONFIG_PACKAGE_wireguard-tools=y \
+            CONFIG_PACKAGE_luci-proto-wireguard=y \
+            CONFIG_PACKAGE_kmod-pppoe=y \
+            CONFIG_PACKAGE_odhcp6c=y; do
             if ! grep -qx "$pkg" .config; then
-              echo "Missing required package after defconfig: ${pkg#CONFIG_PACKAGE_}"
+              echo "::error::Missing required package after defconfig: ${pkg#CONFIG_PACKAGE_}"
               exit 1
+            fi
+          done
+
+          # 禁止项：只跑 sing-box，xray 不能进来；无线驱动必须真的关掉
+          for pkg in xray-core kmod-ath10k-ct; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "::error::CONFIG_PACKAGE_${pkg} 仍被启用，与预期不符"
+              exit 1
+            fi
+          done
+
+          # hostapd 属于"没关干净"而不是致命问题，只提示
+          for pkg in wpad-openssl wpad-basic-mbedtls luci-app-openclash; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "::warning::CONFIG_PACKAGE_${pkg} 仍被启用，会多占体积"
             fi
           done
 
@@ -198,8 +207,6 @@ jobs:
         id: compile
         run: |
           export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
-          which cmake
-          cmake --version
 
           cd openwrt
           echo "$(nproc) thread compile"
@@ -265,19 +272,20 @@ jobs:
         if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
         run: |
           cat > release.txt <<'EOF'
-          ## R619AC ImmortalWrt 25.12 稳定版固件
+          ## R619AC ImmortalWrt 25.12 固件（Sing-Box 版）
 
           :clock3: **构建时间**: BUILD_TIME
           :calendar: **自动发布**: 每月 28 日自动构建更新
 
-          ### :red_envelope: 固件说明及默认配置
+          ### :red_envelope: 固件说明
 
           - **后台地址**: 192.168.88.1
           - **管理账号**: root
           - **管理密码**: 无密码，初次登录直接进入
-          - **Wi-Fi 名称**: ImmortalWrt 或 OpenWrt
-          - **Wi-Fi 密码**: 默认无密码
-          - **底层源码**: 基于 [ImmortalWrt 25.12 分支](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)
+          - **网络模式**: PPPoE 拨号 / IPv6 / 无无线（纯有线）
+          - **代理**: PassWall（仅 Sing-Box 内核，含 geoip/geosite 分流数据）
+          - **WireGuard**: 已内置服务端支持，SSH 执行 `wg-server-init -e 你的域名` 一键部署
+          - **底层源码**: [ImmortalWrt 25.12](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)
           EOF
           sed -i "s/BUILD_TIME/$(date +"%Y-%m-%d %H:%M:%S")/" release.txt
 
