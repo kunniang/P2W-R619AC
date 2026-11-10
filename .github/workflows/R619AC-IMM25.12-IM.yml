@@ -40,13 +40,28 @@ jobs:
 
       - name: Validate required files
         run: |
-          for file in "$CONFIG_FILE" "$DIY_P1_SH" "$DIY_P2_SH" "files/usr/bin/wg-server-init"; do
+          for file in "$CONFIG_FILE" "$DIY_P1_SH" "$DIY_P2_SH"; do
             if [ ! -e "$file" ]; then
               echo "::error::Missing required file: $file"
               exit 1
             fi
           done
-          chmod +x "files/usr/bin/wg-server-init"
+
+          # WireGuard 部署脚本属于可选项：放在仓库根目录时自动归位，缺失只提示不阻断。
+          # WireGuard 服务端本身由 kmod-wireguard / wireguard-tools / luci-proto-wireguard 提供，
+          # 与这个便捷脚本无关。
+          if [ ! -f "files/usr/bin/wg-server-init" ] && [ -f "wg-server-init" ]; then
+            mkdir -p files/usr/bin
+            mv wg-server-init files/usr/bin/wg-server-init
+            echo "已把仓库根目录的 wg-server-init 归位到 files/usr/bin/"
+          fi
+
+          if [ -f "files/usr/bin/wg-server-init" ]; then
+            chmod +x "files/usr/bin/wg-server-init"
+            echo "WireGuard 部署脚本已就位"
+          else
+            echo "::warning::未提供 files/usr/bin/wg-server-init，固件将不含该便捷脚本（不影响 WireGuard 服务端功能）"
+          fi
 
       - name: Initialization environment
         env:
@@ -146,10 +161,13 @@ jobs:
           cd openwrt
           "$GITHUB_WORKSPACE/$DIY_P2_SH"
 
-          # WireGuard 部署工具必须随固件进 rootfs
-          test -f files/usr/bin/wg-server-init \
-            || { echo "::error::files/usr/bin/wg-server-init 没有进到 openwrt/files"; exit 1; }
-          chmod 755 files/usr/bin/wg-server-init
+          # WireGuard 部署脚本：存在则确保可执行位，缺失只提示（不阻断编译）
+          if [ -f files/usr/bin/wg-server-init ]; then
+            chmod 755 files/usr/bin/wg-server-init
+            echo "WireGuard 部署脚本已就位: /usr/bin/wg-server-init"
+          else
+            echo "::warning::固件将不含 /usr/bin/wg-server-init（不影响 WireGuard 服务端功能）"
+          fi
 
       - name: SSH connection to Actions
         uses: P3TERX/ssh2actions@v1.0.0
@@ -284,7 +302,7 @@ jobs:
           - **管理密码**: 无密码，初次登录直接进入
           - **网络模式**: PPPoE 拨号 / IPv6 / 无无线（纯有线）
           - **代理**: PassWall（仅 Sing-Box 内核，含 geoip/geosite 分流数据）
-          - **WireGuard**: 已内置服务端支持，SSH 执行 `wg-server-init -e 你的域名` 一键部署
+          - **WireGuard**: 已内置服务端支持（网络 → 接口 → 协议选 WireGuard）；含 wg-server-init 时可 `wg-server-init -e 你的域名` 一键部署
           - **底层源码**: [ImmortalWrt 25.12](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)
           EOF
           sed -i "s/BUILD_TIME/$(date +"%Y-%m-%d %H:%M:%S")/" release.txt
